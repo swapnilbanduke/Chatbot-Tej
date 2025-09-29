@@ -1,167 +1,237 @@
 import os
-import pdfplumber
-import streamlit as st
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.document_loaders.csv_loader import CSVLoader
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.vectorstores import FAISS
-from langchain.prompts import load_prompt
-from langchain.text_splitter import CharacterTextSplitter
-from streamlit import session_state as ss
-import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
-import uuid
 import json
+import uuid
 import time
 import datetime
+import streamlit as st
 
-# Function to check if a string is a valid JSON
-def is_valid_json(data):
+# --- LangChain / OpenAI (modern adapters) ---
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain_text_splitters import CharacterTextSplitter
+
+# Community loaders/vectorstores (new import paths)
+from langchain_community.document_loaders import PyPDFLoader, CSVLoader
+from langchain_community.vectorstores import FAISS
+
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def is_valid_json(data: str) -> bool:
     try:
         json.loads(data)
         return True
     except json.JSONDecodeError:
         return False
 
-if "firebase_json_key" in os.environ:
-    firebase_json_key = os.getenv("firebase_json_key")
-else:
-    firebase_json_key = st.secrets["firebase_json_key"]
+def read_secret(name: str, default: str = "") -> str:
+    """Read a secret from Streamlit, fallback to env, and strip whitespace."""
+    val = ""
+    try:
+        if name in st.secrets:
+            val = st.secrets[name]
+        else:
+            val = os.getenv(name, default)
+    except Exception:
+        val = os.getenv(name, default)
+    return (val or "").strip()
 
-firebase_credentials = json.loads(firebase_json_key)
+# ------------------------------------------------------------
+# Firebase init
+# ------------------------------------------------------------
+firebase_json_key = read_secret("firebase_json_key")
+firebase_credentials = json.loads(firebase_json_key) if firebase_json_key else None
 
-# Function to initialize connection to Firebase Firestore
 @st.cache_resource
 def init_connection():
+    if not firebase_credentials:
+        raise RuntimeError("Missing firebase_json_key in secrets.")
     cred = credentials.Certificate(firebase_credentials)
-    firebase_admin.initialize_app(cred)
+    # Avoid 'already initialized' error on reruns
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
     return firestore.client()
 
-# Attempt to connect to Firebase Firestore
+db = None
 try:
     db = init_connection()
+    conversations_collection = db.collection("conversations")
 except Exception as e:
-    st.write("Failed to connect to Firebase:", e)
+    st.warning(f"Failed to connect to Firebase: {e}")
+    conversations_collection = None
 
-# Access Firebase Firestore collection
-if 'db' in locals():
-    conversations_collection = db.collection('conversations')
-else:
-    st.write("Unable to access conversations collection. Firebase connection not established.")
+# ------------------------------------------------------------
+# OpenAI key handling
+# ------------------------------------------------------------
+openai_api_key = read_secret("OPENAI_API_KEY")
+if not openai_api_key:
+    st.error("OPENAI_API_KEY missing. Add it to Streamlit secrets.")
+    st.stop()
 
+# Make sure any libs reading env get the same key
+os.environ["OPENAI_API_KEY"] = openai_api_key
 
-# Retrieve OpenAI API key
-openai_api_key = os.getenv("OPENAI_API_KEY", st.secrets["OPENAI_API_KEY"].strip())
-
-# Streamlit app title and disclaimer
+# ------------------------------------------------------------
+# App UI
+# ------------------------------------------------------------
 st.title("SwapnilGPT - Swapnil's Resume Bot")
 st.image("image/jpg_44-2.jpg", use_column_width=True)
-with st.expander("⚠️Disclaimer"):
-    st.write("""This bot is a LLM trained on GPT-3.5-turbo model to answer questions about Swapnil's professional background and qualifications. Your responses are recorded in a database for quality assurance and improvement purposes. Please be respectful and avoid asking personal or inappropriate questions.""")
 
-# Define file paths and load initial settings
+with st.expander("⚠️ Disclaimer"):
+    st.write(
+        """This bot is an LLM-based assistant that answers questions about \
+Swapnil C. Banduke's professional background. Some conversation data may be stored \
+for quality and improvement. Please keep it professional."""
+    )
+
+# Paths
 path = os.path.dirname(__file__)
-prompt_template = os.path.join(path, "templates/template.json")
-prompt = load_prompt(prompt_template)
+prompt_template = os.path.join(path, "templates/template.json")  # if you rely on it elsewhere
 faiss_index = os.path.join(path, "faiss_index")
 data_source = os.path.join(path, "data/csv.csv")
-pdf_source=os.path.join(path, "data/resume.pdf")
-# Function to store conversation in Firebase
+pdf_source = os.path.join(path, "data/resume.pdf")
+
+# ------------------------------------------------------------
+# Persist conversation
+# ------------------------------------------------------------
 def store_conversation(conversation_id, user_message, bot_message, answered):
+    if not conversations_collection:
+        return
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     data = {
         "conversation_id": conversation_id,
         "timestamp": timestamp,
         "user_message": user_message,
         "bot_message": bot_message,
-        "answered": answered
+        "answered": answered,
     }
-    conversations_collection.add(data)
+    try:
+        conversations_collection.add(data)
+    except Exception as e:
+        st.info(f"(Note) Could not store conversation: {e}")
 
-# Initialize OpenAI embeddings
-embeddings = OpenAIEmbeddings()
+# ------------------------------------------------------------
+# Embeddings (pass key explicitly)
+# ------------------------------------------------------------
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=openai_api_key)
 
-# Load FAISS index or create a new one if it doesn't exist
+# ------------------------------------------------------------
+# Load or build FAISS index
+# ------------------------------------------------------------
 if os.path.exists(faiss_index):
-    vectors = FAISS.load_local(faiss_index, embeddings, allow_dangerous_deserialization=True)
-else:
-    # Load data from PDF and CSV sources
-    text_splitter = CharacterTextSplitter(
-    separator="\n",
-    chunk_size=400,
-    chunk_overlap=40
+    vectors = FAISS.load_local(
+        faiss_index,
+        embeddings,
+        allow_dangerous_deserialization=True  # you’re already opting into this
     )
+else:
+    text_splitter = CharacterTextSplitter(
+        separator="\n",
+        chunk_size=400,
+        chunk_overlap=40,
+    )
+
+    # Load sources
     pdf_loader = PyPDFLoader(pdf_source)
     pdf_data = pdf_loader.load_and_split(text_splitter=text_splitter)
+
     csv_loader = CSVLoader(file_path=data_source, encoding="utf-8")
     csv_data = csv_loader.load()
+
     data = pdf_data + csv_data
 
-    # Create embeddings for the documents and save the index
+    # Build index
     vectors = FAISS.from_documents(data, embeddings)
-    vectors.save_local("faiss_index")
+    vectors.save_local(faiss_index)
 
-# Initialize conversational retrieval chain
-retriever = vectors.as_retriever(search_type="similarity", search_kwargs={"k": 6, "include_metadata": True, "score_threshold": 0.6})
-chain = ConversationalRetrievalChain.from_llm(llm=ChatOpenAI(temperature=0.5, model_name='gpt-3.5-turbo-0125', openai_api_key=openai_api_key), 
-                                              retriever=retriever, return_source_documents=True, verbose=True, chain_type="stuff",
-                                              max_tokens_limit=4097, combine_docs_chain_kwargs={"prompt": prompt})
+# ------------------------------------------------------------
+# Retriever & LLM
+# ------------------------------------------------------------
+retriever = vectors.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 6, "include_metadata": True, "score_threshold": 0.6},
+)
 
-# Initialize conversational retrieval chain
-retriever = vectors.as_retriever(search_type="similarity", search_kwargs={"k": 6, "include_metadata": True, "score_threshold": 0.6})
+llm = ChatOpenAI(
+    model_name="gpt-3.5-turbo-0125",  # keep your current choice
+    temperature=0.5,
+    api_key=openai_api_key,
+)
 
+# If you have a custom prompt JSON you want to use in the combine chain,
+# load it here. Keeping your original loader if it’s needed by your template.
+from langchain.prompts import load_prompt
+prompt = load_prompt(prompt_template)
 
 chain = ConversationalRetrievalChain.from_llm(
-    llm=ChatOpenAI(temperature=0.5, model_name='gpt-3.5-turbo-0125', openai_api_key=openai_api_key),
+    llm=llm,
     retriever=retriever,
     return_source_documents=True,
     verbose=True,
     chain_type="stuff",
-    max_tokens_limit=40970,
-    combine_docs_chain_kwargs={"prompt": prompt}
+    # Avoid the incorrect 40970; let LC handle token budget or set a sane value:
+    # max_tokens_limit=4097,
+    combine_docs_chain_kwargs={"prompt": prompt},
 )
 
-# Function to handle conversational chat
+# ------------------------------------------------------------
+# Chat function
+# ------------------------------------------------------------
 def conversational_chat(query):
     with st.spinner("Thinking..."):
-        result = chain({
-            "system": "You are a Resume Bot, a comprehensive, interactive resource for exploring Swapnil C. Banduke's background, skills, and expertise. Be polite and provide answers based on the provided context only. Only answer questions relevant to Swapnil and his work experience. Answer questions if they are ONLY regarding Swapnil Banduke. If the question is not relevant to Swapnil, reply that you are a Resume bot. You can make up projects with the skills and projects Swapnil has if the question requests a skill set related to data science, machine learning, database management, or computer science",
-            "question": query,
-            "chat_history": st.session_state['history']
-        })
-    
-    # Check if the result is a valid JSON
+        result = chain(
+            {
+                "question": query,
+                "chat_history": st.session_state.get("history", []),
+            }
+        )
+
+    # Expect the model to return JSON in result["answer"]
     if is_valid_json(result["answer"]):
         data = json.loads(result["answer"])
     else:
-        data = json.loads('{"answered":"false", "response":"Hmm... Something is not right. I\'m experiencing technical difficulties. Try asking your question again or ask another question"}')
-    
+        data = json.loads(
+            '{"answered":"false","response":"Hmm... Something is not right. '
+            'I\'m experiencing technical difficulties. Try again or ask another question."}'
+        )
+
     answered = data.get("answered", "false")
     response = data.get("response", "")
     questions = data.get("questions", [])
 
-    full_response = "--"
+    # Record history
+    st.session_state["history"].append((query, response))
 
-    # Append user query and bot response to chat history
-    st.session_state['history'].append((query, response))
-    
-    # Process the response based on the answer status
-    if ('I am tuned to only answer questions' in response) or (response == ""):
-        full_response = """"Unfortunately, I can't answer this question. My capabilities are limited to providing information about Swapnil's professional background and qualifications. If you have other inquiries, I recommend reaching out to Swapnil on [LinkedIn](https://www.linkedin.com/in/swapnil-banduke). I can answer questions like:\n - What is Swapnil's educational background?\n - Can you list Swapnil's professional experience?\n - What skills does Swapnil possess?"""
+    # Compose final response
+    if ("I am tuned to only answer questions" in response) or (response.strip() == ""):
+        full_response = (
+            "Unfortunately, I can’t answer this question. I only provide information about "
+            "Swapnil’s professional background and qualifications. If you have other inquiries, "
+            "reach out to Swapnil on [LinkedIn](https://www.linkedin.com/in/swapnil-banduke).\n\n"
+            "I can answer questions like:\n"
+            "- What is Swapnil’s educational background?\n"
+            "- Can you list Swapnil’s professional experience?\n"
+            "- What skills does Swapnil possess?"
+        )
         store_conversation(st.session_state["uuid"], query, full_response, answered)
     else:
-        markdown_list = ""
-        for item in questions:
-            markdown_list += f"- {item}\n"
-        full_response = response + "\n\n What else would you like to know about Swapnil? You can ask me: \n" + markdown_list
+        markdown_list = "".join(f"- {item}\n" for item in questions)
+        full_response = (
+            response
+            + "\n\nWhat else would you like to know about Swapnil? You can ask me:\n"
+            + markdown_list
+        )
         store_conversation(st.session_state["uuid"], query, full_response, answered)
-    
+
     return full_response
 
-# Initialize session variables if not already present
+# ------------------------------------------------------------
+# Session init
+# ------------------------------------------------------------
 if "uuid" not in st.session_state:
     st.session_state["uuid"] = str(uuid.uuid4())
 
@@ -169,31 +239,51 @@ if "openai_model" not in st.session_state:
     st.session_state["openai_model"] = "gpt-3.5-turbo-0125"
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state["messages"] = []
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        welcome_message ="Welcome! I'm **Resume Bot**, a virtual assistant designed to provide insights into Swapnil C. Banduke's background and qualifications.\n\nFeel free to inquire about any aspect of Swapnil's profile, such as his educational journey, internships, professional projects, areas of expertise in data science, machine learning, database management, or his future goals.\n\n- His Master's in Business Analytics with a focus on Data Science from UTD\n- His track record in roles at companies like Kirloskar Brothers Limited and EVERSANA\n- His proficiency in programming languages, ML frameworks, data visualization tools, and database management systems\n- His passion for leveraging data to drive business impact and optimize performance\n\nWhat would you like to know first? I'm ready to answer your questions in detail."
+        welcome_message = (
+            "Welcome! I'm **Resume Bot**, here to provide insights into "
+            "Swapnil C. Banduke's background and qualifications.\n\n"
+            "Ask about education, roles, projects, skills (DS/ML/DB/visualization), "
+            "or goals. For example:\n"
+            "- His Master's in Business Analytics (Data Science) from UTD\n"
+            "- Experience at Kirloskar Brothers Limited and EVERSANA\n"
+            "- Proficiency in programming, ML frameworks, visualization tools, and databases\n"
+            "- How he leverages data to drive business impact\n\n"
+            "What would you like to know first?"
+        )
+        st.markdown(welcome_message)
 
+if "history" not in st.session_state:
+    st.session_state["history"] = []
 
-        message_placeholder.markdown(welcome_message)
+# ------------------------------------------------------------
+# Minimal sanity test button (optional)
+# ------------------------------------------------------------
+with st.expander("🔎 Debug (optional)"):
+    if st.button("Run embedding sanity test"):
+        try:
+            _ = OpenAIEmbeddings(model="text-embedding-3-small", api_key=openai_api_key).embed_query("hello")
+            st.success("Embedding sanity test: OK")
+        except Exception as e:
+            st.error(f"Embedding sanity test failed: {e}")
 
-if 'history' not in st.session_state:
-    st.session_state['history'] = []
-
-# Display previous chat messages
-for message in st.session_state.messages:
+# ------------------------------------------------------------
+# Chat loop
+# ------------------------------------------------------------
+# Display previous messages
+for message in st.session_state["messages"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Process user input and display bot response
-if prompt := st.chat_input("Ask me about anything"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+# Input
+if user_prompt := st.chat_input("Ask me about anything"):
+    st.session_state["messages"].append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
-        user_input = prompt
-        st.markdown(prompt)
+        st.markdown(user_prompt)
 
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = conversational_chat(user_input)
-        message_placeholder.markdown(full_response)
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+        answer = conversational_chat(user_prompt)
+        st.markdown(answer)
+
+    st.session_state["messages"].append({"role": "assistant", "content": answer})
