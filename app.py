@@ -54,7 +54,7 @@ else:
 
 
 # Retrieve OpenAI API key
-openai_api_key = os.getenv("OPENAI_API_KEY", st.secrets["OPENAI_API_KEY"])
+openai_api_key = os.getenv("OPENAI_API_KEY", st.secrets["OPENAI_API_KEY"].strip())
 
 # Streamlit app title and disclaimer
 st.title("SwapnilGPT - Swapnil's Resume Bot")
