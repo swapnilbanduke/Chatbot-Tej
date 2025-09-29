@@ -67,7 +67,7 @@ path = os.path.dirname(__file__)
 prompt_template = os.path.join(path, "templates/template.json")
 prompt = load_prompt(prompt_template)
 faiss_index = os.path.join(path, "faiss_index")
-data_source = os.path.join(path, "data/scrapped data.csv")
+data_source = os.path.join(path, "data/csv.csv")
 pdf_source=os.path.join(path, "data/resume.pdf")
 # Function to store conversation in Firebase
 def store_conversation(conversation_id, user_message, bot_message, answered):
